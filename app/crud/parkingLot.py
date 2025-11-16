@@ -56,3 +56,66 @@ def get_parking_spots_by_lot(db: Session, lot_code: str):
         .order_by(ParkingSpot.spot_row.asc(), ParkingSpot.spot_column.asc(), ParkingSpot.spot_id.asc())
         .all()
     )
+
+def get_recent_parking_spots_with_coords(
+    db: Session,
+    lot_code: str | None = None,
+):
+    """
+SELECT a.spot_id, a.spot_row, a.spot_column, b.occupied_cd, b.created_at
+FROM hanaparking.parking_spot a
+JOIN (
+    SELECT *
+    FROM (
+        SELECT 
+            spot_id,
+            occupied_cd,
+            created_at,
+            ROW_NUMBER() OVER (PARTITION BY spot_id ORDER BY created_at DESC) AS rn
+        FROM hanaparking.parking_spot_history
+        -- WHERE lot_code = :lot_code   -- (history에도 lot_code가 있다면)
+    ) t
+    WHERE t.rn = 1
+) b
+ON a.spot_id = b.spot_id
+WHERE a.lot_code = :lot_code
+ORDER BY a.spot_row, a.spot_column;
+"""
+
+
+    # 1) spot_id 별 최신 이력 뽑는 서브쿼리
+    rn = func.row_number().over(
+        partition_by=ParkingSpotHistory.spot_id,
+        order_by=ParkingSpotHistory.created_at.desc(),
+    ).label("rn")
+
+    history_subq = (
+        db.query(
+            ParkingSpotHistory.spot_id.label("spot_id"),
+            ParkingSpotHistory.occupied_cd.label("occupied_cd"),
+            ParkingSpotHistory.created_at.label("created_at"),
+            rn,
+        )
+        .subquery()
+    )
+
+    # 2) parking_spot(a) 와 조인 + rn = 1만 사용
+    query = (
+        db.query(
+            ParkingSpot.spot_id,
+            ParkingSpot.spot_row,
+            ParkingSpot.spot_column,
+            history_subq.c.occupied_cd,
+            history_subq.c.created_at,
+        )
+        .join(history_subq, ParkingSpot.spot_id == history_subq.c.spot_id)
+        .filter(history_subq.c.rn == 1)
+    )
+
+    # lot_code로 제한하고 싶으면 옵션으로
+    if lot_code is not None:
+        query = query.filter(ParkingSpot.lot_code == lot_code)
+
+    # 결과는 튜플 리스트:
+    # (spot_id, spot_row, spot_column, occupied_cd, created_at)
+    return query.all()
