@@ -23,7 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 AI_DIR = BASE_DIR / "ai"
 
 ROI_JSON = AI_DIR / "roi_points.json"
-MODEL_PATH = AI_DIR / "best_hana.pt"
+MODEL_PATH = AI_DIR / "hana_model_v2.pt"
 CROP_SIZE = (200, 300)
 ROWS, COLS = 38, 28
 
