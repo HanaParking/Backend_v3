@@ -40,3 +40,48 @@ class ParkingSpot(Base):
     lot_code: Mapped[str]  = mapped_column(String(50), nullable=False)
     spot_row: Mapped[int]  = mapped_column(Integer, nullable=False)
     spot_column: Mapped[int]= mapped_column(Integer, nullable=False)
+    
+class ParkingLotHistory(Base):
+    __tablename__ = "parking_lot_history"
+    __table_args__ = {"schema": "hanaparking"}
+
+    # PK: history_seq (serial4)
+    history_seq: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        autoincrement=True,
+    )
+
+    # Lot code (예: "A1")
+    lot_code: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # 주차장 이름 (예: "본사 지하주차장")
+    lot_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # 상태 코드 (1 = 정상 등)
+    status_cd: Mapped[str] = mapped_column(
+        String(1),
+        nullable=False,
+        server_default="1"
+    )
+
+    # 점유 차량 수 (occupied)
+    occupied: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0"
+    )
+    
+        # 점유 차량 수 (occupied)
+    capacity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0"
+    )
+
+    # 등록 시각
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime,
+        server_default=func.current_timestamp()
+    )

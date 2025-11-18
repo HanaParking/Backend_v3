@@ -36,3 +36,13 @@ class RealtimePayload(BaseModel):
     ts: str  # ISO 문자열을 그대로 쓸 경우 str
 
     model_config = ConfigDict(from_attributes=True)
+    
+class ParkingLotHistoryOut(BaseModel):
+    lot_code: str
+    lot_name: str | None = None
+    status_cd: str
+    occupied: int
+    capacity: int
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

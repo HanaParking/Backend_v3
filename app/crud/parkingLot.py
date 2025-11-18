@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, and_
-from app.models.parkingLot import ParkingLot, ParkingSpotHistory, ParkingSpot
+from app.models.parkingLot import ParkingLot, ParkingSpotHistory, ParkingSpot, ParkingLotHistory
 
 # 주차장(Lot)관련 CRUD 작업
 
@@ -71,7 +71,7 @@ JOIN (
             spot_id,
             occupied_cd,
             created_at,
-            ROW_NUMBER() OVER (PARTITION BY spot_id ORDER BY created_at DESC) AS rn
+            ROW_NUMBER() OVER (PARTITION BY spot_id ORDER BY history_seq DESC) AS rn
         FROM hanaparking.parking_spot_history
         -- WHERE lot_code = :lot_code   -- (history에도 lot_code가 있다면)
     ) t
@@ -119,3 +119,43 @@ ORDER BY a.spot_row, a.spot_column;
     # 결과는 튜플 리스트:
     # (spot_id, spot_row, spot_column, occupied_cd, created_at)
     return query.all()
+
+def get_parking_lots_history_latest(db: Session):
+    """
+    각 lot_code별 가장 최근 이력 1건 조회.
+
+    SELECT h.*
+    FROM hanaparking.parking_lot_history h
+    JOIN (
+        SELECT lot_code, MAX(created_at) AS max_created_at
+        FROM hanaparking.parking_lot_history
+        GROUP BY lot_code
+    ) sub
+      ON h.lot_code = sub.lot_code
+     AND h.created_at = sub.max_created_at
+    ORDER BY h.lot_code;
+    """
+
+    # 1) lot_code별 max(created_at) 구하는 서브쿼리
+    subq = (
+        db.query(
+            ParkingLotHistory.lot_code.label("lot_code"),
+            func.max(ParkingLotHistory.created_at).label("max_created_at"),
+        )
+        .group_by(ParkingLotHistory.lot_code)
+        .subquery()
+    )
+
+    # 2) 원본 테이블과 조인해서 최신 이력만 가져오기
+    return (
+        db.query(ParkingLotHistory)
+        .join(
+            subq,
+            and_(
+                ParkingLotHistory.lot_code == subq.c.lot_code,
+                ParkingLotHistory.created_at == subq.c.max_created_at,
+            ),
+        )
+        .order_by(ParkingLotHistory.lot_code.asc())
+        .all()
+    )

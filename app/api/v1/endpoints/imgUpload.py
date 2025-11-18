@@ -1,18 +1,18 @@
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from sqlalchemy.orm import Session
 from pathlib import Path
 import os, uuid, json, numpy as np, cv2
 from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Any
+from zoneinfo import ZoneInfo
+import mimetypes
+
 from app.dependencies import get_db, get_redis
 from app.schemas.imgUpload import UploadOut
-from app.models.parkingLot import ParkingSpotHistory
-from ultralytics import YOLO
-from zoneinfo import ZoneInfo
+from app.models.parkingLot import ParkingSpotHistory, ParkingLotHistory
 from app.crud import parkingLot as crud_parkingLot
-from fastapi.responses import FileResponse
-import mimetypes
+from ultralytics import YOLO
 
 router = APIRouter()
 
@@ -28,10 +28,15 @@ CROP_SIZE = (200, 300)
 ROWS, COLS = 38, 28
 
 # ---------- 전역 로드 ----------
+print(f"[INFO] ROI_JSON 경로: {ROI_JSON}")
+print(f"[INFO] MODEL_PATH 경로: {MODEL_PATH}")
+
 with open(ROI_JSON, "r") as f:
     ROI_DATA = json.load(f)
+    print(f"[INFO] ROI_DATA 로드 완료: {len(ROI_DATA)}개 구역")
 
 MODEL = YOLO(MODEL_PATH)
+print("[INFO] YOLO 모델 로드 완료")
 
 # ---------- 유틸리티 ----------
 def sort_points_clockwise(pts):
@@ -41,9 +46,12 @@ def sort_points_clockwise(pts):
     return np.array(pts, dtype=np.float32)
 
 def imdecode_upload(file_bytes: bytes) -> np.ndarray:
+    print(f"[DEBUG] 업로드된 파일 바이트 길이: {len(file_bytes)}")
     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
+        print("[ERROR] 이미지 디코딩 실패")
         raise ValueError("이미지 디코딩 실패")
+    print(f"[INFO] 이미지 디코딩 성공: shape={img.shape}")
     return img
 
 def blank_grids():
@@ -52,23 +60,33 @@ def blank_grids():
     return positions, car_exists
 
 def get_spot_matrix_map(db: Session, lot_code: str):
+    print(f"[INFO] get_spot_matrix_map 호출 lot_code={lot_code}")
     rows = crud_parkingLot.get_parking_spots_by_lot(db, lot_code)
-    spot_map = {}
-    coords = []
+    print(f"[INFO] DB에서 불러온 슬롯 개수: {len(rows)}")
+
+    spot_map: Dict[str, Tuple[int, int]] = {}
+    coords: List[Tuple[int, int]] = []
 
     for r in rows:
         i = int(r.spot_row) - 1
         j = int(r.spot_column) - 1
+        sid = str(r.spot_id).strip()
+        print(f"[DEBUG] 슬롯 로드 → spot_id={sid}, row={r.spot_row}, col={r.spot_column}")
+
         if 0 <= i < ROWS and 0 <= j < COLS:
-            sid = str(r.spot_id).strip()
             spot_map[sid] = (i, j)
             coords.append((i, j))
+        else:
+            print(f"[WARN] 좌표 범위 밖 → spot_id={sid}, (i,j)=({i},{j})")
+
+    print(f"[INFO] spot_map 크기: {len(spot_map)}, coords 개수: {len(coords)}")
     return spot_map, coords
 
 def build_positions_from_db(all_coords: List[Tuple[int, int]]):
     positions, _ = blank_grids()
     for (i, j) in all_coords:
         positions[i][j] = 1
+    print("[INFO] positions 그리드 생성 완료")
     return positions
 
 # ========== 🔥 핵심 기능: infer + DB 저장 + 시각화 이미지 생성 ==========
@@ -81,6 +99,7 @@ def infer_and_map(
     positions: List[List[int]],
 ) -> Tuple[List[List[int]], np.ndarray]:
 
+    print("[INFO] infer_and_map 시작")
     ROWS = len(positions)
     COLS = len(positions[0])
     car_exists = [[0 for _ in range(COLS)] for _ in range(ROWS)]
@@ -101,11 +120,15 @@ def infer_and_map(
         spot_id = str(roi.get("name", "")).strip()
         pts = roi.get("points")
 
+        print(f"[DEBUG] ROI 체크 → id={spot_id}, pts={pts}")
+
         if not spot_id or spot_id not in spot_map or not pts or len(pts) != 4:
+            print(f"[WARN] ROI 스킵됨 → spot_id={spot_id}, spot_map에 없거나 pts 이상")
             continue
 
         (i, j) = spot_map[spot_id]
         if not (0 <= i < ROWS and 0 <= j < COLS and positions[i][j] == 1):
+            print(f"[WARN] ROI 스킵됨 → spot_id={spot_id}, positions 매핑 안됨 또는 범위 밖")
             continue
 
         try:
@@ -120,6 +143,8 @@ def infer_and_map(
             occupied = 0 if label_name.lower() == "empty" else 1
             car_exists[i][j] = occupied
 
+            print(f"[DEBUG] YOLO 결과 → spot={spot_id}, label={label_name}, occupied={occupied}")
+
             # 🔵 시각화 색상
             color = (0, 255, 0) if occupied == 0 else (0, 0, 255)
 
@@ -131,7 +156,7 @@ def infer_and_map(
             pos = tuple(np.mean(src_pts, axis=0).astype(int))
             cv2.putText(img_draw, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # DB insert
+            # DB insert 데이터 준비
             rows_to_insert.append({
                 "history_dt": today,
                 "lot_code": lot_code,
@@ -139,12 +164,22 @@ def infer_and_map(
                 "occupied_cd": "1" if occupied else "0",
             })
 
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] ROI 처리 중 예외 → spot_id={spot_id}, error={e}")
             continue
 
+    print(f"[INFO] ParkingSpotHistory rows_to_insert 개수: {len(rows_to_insert)}")
+
     if rows_to_insert:
-        db.bulk_insert_mappings(ParkingSpotHistory, rows_to_insert)
-        db.commit()
+        try:
+            db.bulk_insert_mappings(ParkingSpotHistory, rows_to_insert)
+            db.commit()
+            print("[INFO] ParkingSpotHistory bulk insert 성공")
+        except Exception as e:
+            db.rollback()
+            print(f"[ERROR] ParkingSpotHistory bulk insert 실패: {e}")
+    else:
+        print("[WARN] ParkingSpotHistory에 INSERT할 데이터가 없습니다.")
 
     return car_exists, img_draw
 
@@ -156,34 +191,72 @@ async def upload_image(
     redis = Depends(get_redis),
 ):
     lot_code = "A1"
+    print(f"[INFO] /img_upload 호출됨, lot_code={lot_code}, filename={file.filename}")
 
     safe_name = f"{uuid.uuid4().hex}_{Path(file.filename).name}"
     file_path = os.path.join(UPLOAD_DIR, safe_name)
+    print(f"[INFO] 저장 예정 파일명: {safe_name}")
 
     # 1️⃣ 이미지 디코드
     try:
         content = await file.read()
+        print(f"[DEBUG] 업로드 파일 크기: {len(content)} bytes")
         img = imdecode_upload(content)
     except Exception as e:
+        print(f"[ERROR] 이미지 디코딩 실패: {e}")
         raise HTTPException(status_code=400, detail=f"이미지 디코딩 실패: {e}")
 
     # 2️⃣ DB → slot 좌표
     spot_map, all_coords = get_spot_matrix_map(db, lot_code)
     if not spot_map:
+        print("[ERROR] 슬롯 정보 없음, spot_map 비어있음")
         raise HTTPException(status_code=404, detail=f"슬롯 정보 없음")
 
     positions = build_positions_from_db(all_coords)
+    print("[INFO] positions / spot_map 로딩 완료")
 
     # 3️⃣ infer + DB 저장 + 시각화 이미지 생성
     try:
         car_exists, img_draw = infer_and_map(db, lot_code, img, ROI_DATA, spot_map, positions)
+        print("[INFO] infer_and_map 완료")
     except Exception as e:
+        print(f"[ERROR] 추론 실패: {e}")
         raise HTTPException(status_code=500, detail=f"추론 실패: {e}")
+
+    # ⭐ 3-1️⃣ 현재 점유한 자리 수(occupied) 합계 계산 + parking_lot_history에 저장
+    try:
+        occupied_count = 0
+        for i in range(len(positions)):
+            for j in range(len(positions[0])):
+                if positions[i][j] == 1 and car_exists[i][j] == 1:
+                    occupied_count += 1
+
+        print(f"[INFO] 집계된 occupied_count = {occupied_count}")
+
+        lot_name = '옥외주차장'
+        status_cd = "1"
+        capacity = 365
+
+        history_row = ParkingLotHistory(
+            lot_code=lot_code,
+            lot_name=lot_name,
+            status_cd=status_cd,
+            capacity=capacity,
+            occupied=occupied_count,
+        )
+        db.add(history_row)
+        db.commit()
+        print("[INFO] ParkingLotHistory insert 성공")
+    except Exception as e:
+        db.rollback()
+        print(f"[WARN] ParkingLotHistory insert 실패: {e}")
 
     # 4️⃣ 원본 대신 ‘시각화된 이미지’를 저장
     try:
         cv2.imwrite(file_path, img_draw)
+        print(f"[INFO] 시각화 이미지 저장 완료: {file_path}")
     except Exception as e:
+        print(f"[ERROR] 이미지 저장 실패: {e}")
         raise HTTPException(status_code=500, detail=f"이미지 저장 실패: {e}")
 
     # 5️⃣ Redis 발행
@@ -196,7 +269,9 @@ async def upload_image(
     try:
         await redis.set("parking_detail_data", json.dumps(realtime_payload))
         await redis.publish("parking_detail_channel", "updated")
+        print(f"[INFO] Redis 발행 완료: channel=parking_detail_channel, payload_ts={realtime_payload['ts']}")
     except Exception as e:
+        print(f"[ERROR] Redis 처리 실패: {e}")
         raise HTTPException(status_code=500, detail=f"Redis 처리 실패: {e}")
 
     return {
@@ -209,11 +284,15 @@ async def upload_image(
 def _get_latest_image_path(upload_dir: str) -> Path | None:
     p = Path(upload_dir)
     if not p.exists():
+        print("[WARN] _get_latest_image_path: 업로드 폴더 없음")
         return None
     files = [f for f in p.iterdir() if f.is_file()]
     if not files:
+        print("[WARN] _get_latest_image_path: 파일 없음")
         return None
-    return max(files, key=lambda f: f.stat().st_mtime)
+    latest = max(files, key=lambda f: f.stat().st_mtime)
+    print(f"[INFO] 최신 이미지 파일: {latest}")
+    return latest
 
 @router.get("/img_latest", response_class=HTMLResponse)
 def view_latest_image():
@@ -222,6 +301,7 @@ def view_latest_image():
         return HTMLResponse("<h1>이미지가 없습니다.</h1>")
 
     img_url = f"/upload_images/{latest.name}"
+    print(f"[INFO] /img_latest → {img_url}")
 
     html = f"""
     <html>
@@ -240,26 +320,26 @@ def list_images():
     """
     p = Path(UPLOAD_DIR)
     if not p.exists():
+        print("[WARN] img_files: 업로드 폴더 없음")
         return HTMLResponse("<h3>업로드 폴더가 없습니다.</h3>", status_code=200)
 
-    # jpg/png 등만 대상으로
     exts = {".jpg", ".jpeg", ".png", ".gif"}
     files = [
         f for f in p.iterdir()
         if f.is_file() and f.suffix.lower() in exts
     ]
 
+    print(f"[INFO] img_files: 이미지 파일 개수 = {len(files)}")
+
     if not files:
         return HTMLResponse("<h3>저장된 이미지가 없습니다.</h3>", status_code=200)
 
-    # 최근순 정렬 (수정시간 기준 최신 → 오래된 순)
     files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
-    # StaticFiles로 /upload_images mount 되어 있다고 가정
     rows_html = []
     for f in files:
         img_url = f"/upload_images/{f.name}"
-        download_url = f"/api/v1/img/img_download?filename={f.name}"  # 라우팅 prefix에 따라 수정
+        download_url = f"/api/v1/img/img_download?filename={f.name}"
         created = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
 
         rows_html.append(f"""

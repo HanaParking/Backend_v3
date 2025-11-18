@@ -3,7 +3,7 @@ from fastapi import Depends, APIRouter, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_db
-from app.schemas.parkingLot import GetParkingLot , ParkingSpotOut, ParkingSpotBasicOut,RealtimePayload
+from app.schemas.parkingLot import GetParkingLot , ParkingSpotOut, ParkingSpotBasicOut,RealtimePayload, ParkingLotHistoryOut
 from app.crud import parkingLot as crud_parkingLot  # crud 모듈 임포트
 from datetime import datetime, timezone
 
@@ -72,4 +72,12 @@ def get_parking_spots(
     db: Session = Depends(get_db),
 ):
     rows = crud_parkingLot.get_parking_spots_by_lot(db, lot_code)
+    return rows
+
+@router.get("/lots", response_model=List[ParkingLotHistoryOut])
+def get_parking_lots_history(db: Session = Depends(get_db)):
+    """
+    주차장별 최신 이력 조회 (lot_code별 created_at 가장 최근 1건)
+    """
+    rows = crud_parkingLot.get_parking_lots_history_latest(db)
     return rows
