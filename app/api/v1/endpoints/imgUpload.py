@@ -71,7 +71,7 @@ def get_spot_matrix_map(db: Session, lot_code: str):
         i = int(r.spot_row) - 1
         j = int(r.spot_column) - 1
         sid = str(r.spot_id).strip()
-        print(f"[DEBUG] 슬롯 로드 → spot_id={sid}, row={r.spot_row}, col={r.spot_column}")
+        #print(f"[DEBUG] 슬롯 로드 → spot_id={sid}, row={r.spot_row}, col={r.spot_column}")
 
         if 0 <= i < ROWS and 0 <= j < COLS:
             spot_map[sid] = (i, j)
@@ -113,8 +113,12 @@ def infer_and_map(
         [0, CROP_SIZE[1]],
     ])
 
+    # 🔹 한국 시간 기준 날짜
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-    rows_to_insert = []
+    rows_to_insert: List[Dict[str, Any]] = []
+
+    # ✅ 이번 추론에서 실제로 YOLO를 태운 자리 목록 (spot_id 기준)
+    processed_spot_ids: set[str] = set()
 
     for roi in ROI_DATA:
         spot_id = str(roi.get("name", "")).strip()
@@ -122,6 +126,7 @@ def infer_and_map(
 
         print(f"[DEBUG] ROI 체크 → id={spot_id}, pts={pts}")
 
+        # ROI에 정의됐지만 DB에 자리코드가 없거나, pts 이상하면 스킵
         if not spot_id or spot_id not in spot_map or not pts or len(pts) != 4:
             print(f"[WARN] ROI 스킵됨 → spot_id={spot_id}, spot_map에 없거나 pts 이상")
             continue
@@ -140,6 +145,7 @@ def infer_and_map(
             label_idx = int(result[0].probs.top1)
             label_name = MODEL.names[label_idx]
 
+            # empty → 0, 나머지(차 있음) → 1
             occupied = 0 if label_name.lower() == "empty" else 1
             car_exists[i][j] = occupied
 
@@ -156,17 +162,49 @@ def infer_and_map(
             pos = tuple(np.mean(src_pts, axis=0).astype(int))
             cv2.putText(img_draw, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # DB insert 데이터 준비
+            # ✅ YOLO를 돌린 자리만 우선 rows_to_insert에 추가
             rows_to_insert.append({
                 "history_dt": today,
                 "lot_code": lot_code,
                 "spot_id": spot_id,
                 "occupied_cd": "1" if occupied else "0",
             })
+            processed_spot_ids.add(spot_id)
 
         except Exception as e:
             print(f"[ERROR] ROI 처리 중 예외 → spot_id={spot_id}, error={e}")
             continue
+
+    # ✅ 여기서부터가 핵심!
+    # DB에 존재하는 모든 슬롯(spot_map 기준)을 훑으면서,
+    # 이번 infer 과정에서 처리되지 않은 자리들은
+    #  - car_exists: 2 (ROI 없음 / 비활성)
+    #  - DB 저장: occupied_cd = '0' (빈 자리 취급)
+    for sid, (i, j) in spot_map.items():
+        if sid in processed_spot_ids:
+            # 이미 위에서 YOLO 돌려서 rows_to_insert에 들어간 자리면 패스
+            continue
+
+        if not (0 <= i < ROWS and 0 <= j < COLS):
+            print(f"[WARN] spot_map 좌표 범위 밖 → spot_id={sid}, (i,j)=({i},{j})")
+            continue
+
+        if positions[i][j] != 1:
+            # positions에 표시되지 않은 좌석이면 스킵(안전용)
+            print(f"[WARN] positions에 표시되지 않은 슬롯 → spot_id={sid}, (i,j)=({i},{j})")
+            continue
+
+        # 🔸 ROI/모델 미적용 슬롯 → 프론트에는 2 (ROI 없음)으로 전달
+        car_exists[i][j] = 2
+
+        # 🔸 DB에는 0(빈 자리)로 저장
+        rows_to_insert.append({
+            "history_dt": today,
+            "lot_code": lot_code,
+            "spot_id": sid,
+            "occupied_cd": "0",
+        })
+        print(f"[INFO] ROI/모델 미적용 슬롯 0으로 추가 → spot_id={sid}, occupied=0 (car_exists=2)")
 
     print(f"[INFO] ParkingSpotHistory rows_to_insert 개수: {len(rows_to_insert)}")
 
@@ -182,6 +220,8 @@ def infer_and_map(
         print("[WARN] ParkingSpotHistory에 INSERT할 데이터가 없습니다.")
 
     return car_exists, img_draw
+
+
 
 # ========== 🔥 이미지 업로드 엔드포인트 ==========
 @router.post("/img_upload", response_model=UploadOut, status_code=201)
@@ -217,32 +257,58 @@ async def upload_image(
 
     # 3️⃣ infer + DB 저장 + 시각화 이미지 생성
     try:
-        car_exists, img_draw = infer_and_map(db, lot_code, img, ROI_DATA, spot_map, positions)
+        car_exists, img_draw = infer_and_map(
+            db=db,
+            lot_code=lot_code,
+            img_bgr=img,
+            ROI_DATA=ROI_DATA,
+            spot_map=spot_map,
+            positions=positions,
+        )
         print("[INFO] infer_and_map 완료")
     except Exception as e:
         print(f"[ERROR] 추론 실패: {e}")
         raise HTTPException(status_code=500, detail=f"추론 실패: {e}")
 
-    # ⭐ 3-1️⃣ 현재 점유한 자리 수(occupied) 합계 계산 + parking_lot_history에 저장
+    # ⭐ 3-1️⃣ 현재 점유한 자리 수(occupied) + 실제 인식된 capacity 계산
     try:
         occupied_count = 0
-        for i in range(len(positions)):
-            for j in range(len(positions[0])):
-                if positions[i][j] == 1 and car_exists[i][j] == 1:
-                    occupied_count += 1
+        capacity = 0  # ✅ ROI가 있어서 실제로 인식 가능한 슬롯 수 (occupied + empty)
 
-        print(f"[INFO] 집계된 occupied_count = {occupied_count}")
+        rows = len(positions)
+        cols = len(positions[0]) if rows > 0 else 0
+
+        for i in range(rows):
+            for j in range(cols):
+                # positions[i][j] == 1 인 곳만 "주차 슬롯"으로 간주
+                if positions[i][j] != 1:
+                    continue
+
+                status = car_exists[i][j]  # 0/1/2
+
+                if status == 1:
+                    # 차가 있는 자리 → occupied + capacity 둘 다 증가
+                    occupied_count += 1
+                    capacity += 1
+                elif status == 0:
+                    # 차는 없지만 ROI로 인식된 빈자리 → capacity만 증가
+                    capacity += 1
+                elif status == 2:
+                    # ROI 없음 → 이번 스캔에서는 capacity에 포함하지 않음
+                    # (실제 인식 불가능한 자리이므로 무시)
+                    continue
+
+        print(f"[INFO] 집계된 occupied_count = {occupied_count}, capacity = {capacity}")
 
         lot_name = '옥외주차장'
         status_cd = "1"
-        capacity = 365
 
         history_row = ParkingLotHistory(
             lot_code=lot_code,
             lot_name=lot_name,
             status_cd=status_cd,
-            capacity=capacity,
-            occupied=occupied_count,
+            capacity=capacity,          # ✅ 실제 인식된 슬롯 수로 반영
+            occupied=occupied_count,    # ✅ 실제 차가 있는 슬롯 수
         )
         db.add(history_row)
         db.commit()
@@ -263,7 +329,7 @@ async def upload_image(
     realtime_payload = {
         "positions": positions,
         "carExists": car_exists,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),  # ← 원하면 여기도 Asia/Seoul로 바꿀 수 있음
     }
 
     try:
@@ -277,7 +343,7 @@ async def upload_image(
     return {
         "filename": safe_name,
         "url": f"/upload_images/{safe_name}",
-        "message": f"분석 및 시각화 완료",
+        "message": "분석 및 시각화 완료",
     }
 
 # ========== 🔥 최신 이미지 확인 ==========
